@@ -2,8 +2,12 @@ name: 'Create Pull Request'
 description: 'Creates a pull request for changes to your repository in the actions workspace'
 inputs:
   token:
-    description: 'GITHUB_TOKEN or a `repo` scoped Personal Access Token (PAT)'
+    description: 'The token that the action will use to create and update the pull request.'
     default: ${{ github.token }}
+  branch-token:
+    description: >
+      The token that the action will use to create and update the branch.
+      Defaults to the value of `token`.
   path:
     description: >
       Relative path under $GITHUB_WORKSPACE to the repository.
@@ -20,12 +24,12 @@ inputs:
     description: >
       The committer name and email address in the format `Display Name <email@address.com>`.
       Defaults to the GitHub Actions bot user.
-    default: 'GitHub <noreply@github.com>'
+    default: 'github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>'
   author:
     description: >
       The author name and email address in the format `Display Name <email@address.com>`.
       Defaults to the user who triggered the workflow run.
-    default: '${{ github.actor }} <${{ github.actor }}@users.noreply.github.com>'
+    default: '${{ github.actor }} <${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com>'
   signoff:
     description: 'Add `Signed-off-by` line by the committer at the end of the commit log message.'
     default: false
@@ -34,8 +38,7 @@ inputs:
     default: 'create-pull-request/patch'
   delete-branch:
     description: >
-      Delete the `branch` when closing pull requests, and when undeleted after merging.
-      Recommend `true`.
+      Delete the `branch` if it doesn't have an active pull request associated with it.
     default: false
   branch-suffix:
     description: 'The branch suffix type when using the alternative branching strategy.'
@@ -48,6 +51,9 @@ inputs:
       A fork of the checked out parent repository to which the pull request branch will be pushed.
       e.g. `owner/repo-fork`.
       The pull request will be created to merge the fork's branch into the parent's base.
+  sign-commits:
+    description: 'Sign commits as `github-actions[bot]` when using `GITHUB_TOKEN`, or your own bot when using GitHub App tokens.'
+    default: false
   title:
     description: 'The title of the pull request.'
     default: 'Changes by create-pull-request action'
@@ -69,8 +75,13 @@ inputs:
   milestone:
     description: 'The number of the milestone to associate the pull request with.'
   draft:
-    description: 'Create a draft pull request. It is not possible to change draft status after creation except through the web interface'
+    description: >
+      Create a draft pull request.
+      Valid values are `true` (only on create), `always-true` (on create and update), and `false`.
     default: false
+  maintainer-can-modify:
+    description: 'Indicates whether maintainers can modify the pull request.'
+    default: true
 outputs:
   pull-request-number:
     description: 'The pull request number'
@@ -80,8 +91,10 @@ outputs:
     description: 'The pull request operation performed by the action, `created`, `updated` or `closed`.'
   pull-request-head-sha:
     description: 'The commit SHA of the pull request branch.'
+  pull-request-branch:
+    description: 'The pull request branch name'
 runs:
-  using: 'node16'
+  using: 'node20'
   main: 'dist/index.js'
 branding:
   icon: 'git-pull-request'
