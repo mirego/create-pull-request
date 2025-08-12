@@ -6,11 +6,12 @@ import {
 } from './create-or-update-branch'
 import {GitHubHelper} from './github-helper'
 import {GitCommandManager} from './git-command-manager'
-import {GitAuthHelper} from './git-auth-helper'
+import {GitConfigHelper} from './git-config-helper'
 import * as utils from './utils'
 
 export interface Inputs {
   token: string
+  branchToken: string
   path: string
   addPaths: string[]
   commitMessage: string
@@ -22,6 +23,7 @@ export interface Inputs {
   branchSuffix: string
   base: string
   pushToFork: string
+  signCommits: boolean
   title: string
   body: string
   bodyPath: string
@@ -30,49 +32,27 @@ export interface Inputs {
   reviewers: string[]
   teamReviewers: string[]
   milestone: number
-  draft: boolean
+  draft: {
+    value: boolean
+    always: boolean
+  }
+  maintainerCanModify: boolean
 }
 
 export async function createPullRequest(inputs: Inputs): Promise<void> {
-  let gitAuthHelper
+  let gitConfigHelper, git
   try {
-    if (!inputs.token) {
-      throw new Error(`Input 'token' not supplied. Unable to continue.`)
-    }
-    if (inputs.bodyPath) {
-      if (!utils.fileExistsSync(inputs.bodyPath)) {
-        throw new Error(`File '${inputs.bodyPath}' does not exist.`)
-      }
-      // Update the body input with the contents of the file
-      inputs.body = utils.readFile(inputs.bodyPath)
-    }
-    // 65536 characters is the maximum allowed for the pull request body.
-    if (inputs.body.length > 65536) {
-      core.warning(
-        `Pull request body is too long. Truncating to 65536 characters.`
-      )
-      inputs.body = inputs.body.substring(0, 65536)
-    }
-
-    // Get the repository path
-    const repoPath = utils.getRepoPath(inputs.path)
-    // Create a git command manager
-    const git = await GitCommandManager.create(repoPath)
-
-    // Save and unset the extraheader auth config if it exists
     core.startGroup('Prepare git configuration')
-    gitAuthHelper = new GitAuthHelper(git)
-    await gitAuthHelper.addSafeDirectory()
-    await gitAuthHelper.savePersistedAuth()
+    const repoPath = utils.getRepoPath(inputs.path)
+    git = await GitCommandManager.create(repoPath)
+    gitConfigHelper = await GitConfigHelper.create(git)
     core.endGroup()
 
-    // Init the GitHub client
-    const githubHelper = new GitHubHelper(inputs.token)
-
     core.startGroup('Determining the base and head repositories')
-    // Determine the base repository from git config
-    const remoteUrl = await git.tryGetRemoteUrl()
-    const baseRemote = utils.getRemoteDetail(remoteUrl)
+    const baseRemote = gitConfigHelper.getGitRemote()
+    // Init the GitHub clients
+    const ghBranch = new GitHubHelper(baseRemote.hostname, inputs.branchToken)
+    const ghPull = new GitHubHelper(baseRemote.hostname, inputs.token)
     // Determine the head repository; the target for the pull request branch
     const branchRemoteName = inputs.pushToFork ? 'fork' : 'origin'
     const branchRepository = inputs.pushToFork
@@ -83,12 +63,22 @@ export async function createPullRequest(inputs: Inputs): Promise<void> {
       core.info(
         `Checking if '${branchRepository}' is a fork of '${baseRemote.repository}'`
       )
-      const parentRepository = await githubHelper.getRepositoryParent(
-        branchRepository
+      const baseParentRepository = await ghBranch.getRepositoryParent(
+        baseRemote.repository
       )
-      if (parentRepository != baseRemote.repository) {
+      const branchParentRepository =
+        await ghBranch.getRepositoryParent(branchRepository)
+      if (branchParentRepository == null) {
         throw new Error(
-          `Repository '${branchRepository}' is not a fork of '${baseRemote.repository}'. Unable to continue.`
+          `Repository '${branchRepository}' is not a fork. Unable to continue.`
+        )
+      }
+      if (
+        branchParentRepository != baseRemote.repository &&
+        baseParentRepository != branchParentRepository
+      ) {
+        throw new Error(
+          `Repository '${branchRepository}' is not a fork of '${baseRemote.repository}', nor are they siblings. Unable to continue.`
         )
       }
       // Add a remote for the fork
@@ -107,7 +97,7 @@ export async function createPullRequest(inputs: Inputs): Promise<void> {
     // Configure auth
     if (baseRemote.protocol == 'HTTPS') {
       core.startGroup('Configuring credential for HTTPS authentication')
-      await gitAuthHelper.configureToken(inputs.token)
+      await gitConfigHelper.configureToken(inputs.branchToken)
       core.endGroup()
     }
 
@@ -190,6 +180,11 @@ export async function createPullRequest(inputs: Inputs): Promise<void> {
     )
     core.endGroup()
 
+    // Action outputs
+    const outputs = new Map<string, string>()
+    outputs.set('pull-request-branch', inputs.branch)
+    outputs.set('pull-request-operation', 'none')
+
     // Create or update the pull request branch
     core.startGroup('Create or update the pull request branch')
     const result = await createOrUpdateBranch(
@@ -201,6 +196,9 @@ export async function createPullRequest(inputs: Inputs): Promise<void> {
       inputs.signoff,
       inputs.addPaths
     )
+    outputs.set('pull-request-head-sha', result.headSha)
+    // Set the base. It would have been '' if not specified as an input
+    inputs.base = result.base
     core.endGroup()
 
     if (['created', 'updated'].includes(result.action)) {
@@ -208,39 +206,56 @@ export async function createPullRequest(inputs: Inputs): Promise<void> {
       core.startGroup(
         `Pushing pull request branch to '${branchRemoteName}/${inputs.branch}'`
       )
-      await git.push([
-        '--force-with-lease',
-        branchRemoteName,
-        `${inputs.branch}:refs/heads/${inputs.branch}`
-      ])
+      if (inputs.signCommits) {
+        // Create signed commits via the GitHub API
+        const stashed = await git.stashPush(['--include-untracked'])
+        await git.checkout(inputs.branch)
+        const pushSignedCommitsResult = await ghBranch.pushSignedCommits(
+          git,
+          result.branchCommits,
+          result.baseCommit,
+          repoPath,
+          branchRepository,
+          inputs.branch
+        )
+        outputs.set('pull-request-head-sha', pushSignedCommitsResult.sha)
+        outputs.set(
+          'pull-request-commits-verified',
+          pushSignedCommitsResult.verified.toString()
+        )
+        await git.checkout('-')
+        if (stashed) {
+          await git.stashPop()
+        }
+      } else {
+        await git.push([
+          '--force-with-lease',
+          branchRemoteName,
+          `${inputs.branch}:refs/heads/${inputs.branch}`
+        ])
+      }
       core.endGroup()
     }
 
-    // Set the base. It would have been '' if not specified as an input
-    inputs.base = result.base
-
     if (result.hasDiffWithBase) {
-      // Create or update the pull request
       core.startGroup('Create or update the pull request')
-      const pull = await githubHelper.createOrUpdatePullRequest(
+      const pull = await ghPull.createOrUpdatePullRequest(
         inputs,
         baseRemote.repository,
         branchRepository
       )
-      core.endGroup()
-
-      // Set outputs
-      core.startGroup('Setting outputs')
-      core.setOutput('pull-request-number', pull.number)
-      core.setOutput('pull-request-url', pull.html_url)
+      outputs.set('pull-request-number', pull.number.toString())
+      outputs.set('pull-request-url', pull.html_url)
       if (pull.created) {
-        core.setOutput('pull-request-operation', 'created')
+        outputs.set('pull-request-operation', 'created')
       } else if (result.action == 'updated') {
-        core.setOutput('pull-request-operation', 'updated')
+        outputs.set('pull-request-operation', 'updated')
+        // The pull request was updated AND the branch was updated.
+        // Convert back to draft if 'draft: always-true' is set.
+        if (inputs.draft.always && pull.draft !== undefined && !pull.draft) {
+          await ghPull.convertToDraft(pull.node_id)
+        }
       }
-      core.setOutput('pull-request-head-sha', result.headSha)
-      // Deprecated
-      core.exportVariable('PULL_REQUEST_NUMBER', pull.number)
       core.endGroup()
     } else {
       // There is no longer a diff with the base
@@ -257,21 +272,53 @@ export async function createPullRequest(inputs: Inputs): Promise<void> {
             branchRemoteName,
             `refs/heads/${inputs.branch}`
           ])
-          // Set outputs
-          core.startGroup('Setting outputs')
-          core.setOutput('pull-request-operation', 'closed')
-          core.endGroup()
+          outputs.set('pull-request-operation', 'closed')
         }
       }
     }
+
+    core.startGroup('Setting outputs')
+    // If the head commit is signed, get its verification status if we don't already know it.
+    // This can happen if the branch wasn't updated (action = 'not-updated'), or GPG commit signing is in use.
+    if (
+      !outputs.has('pull-request-commits-verified') &&
+      result.branchCommits.length > 0 &&
+      result.branchCommits[result.branchCommits.length - 1].signed
+    ) {
+      // Using the local head commit SHA because in this case commits have not been pushed via the API.
+      core.info(`Checking verification status of head commit ${result.headSha}`)
+      try {
+        const headCommit = await ghBranch.getCommit(
+          result.headSha,
+          branchRepository
+        )
+        outputs.set(
+          'pull-request-commits-verified',
+          headCommit.verified.toString()
+        )
+      } catch (error) {
+        core.warning('Failed to check verification status of head commit.')
+        core.debug(utils.getErrorMessage(error))
+      }
+    }
+    if (!outputs.has('pull-request-commits-verified')) {
+      outputs.set('pull-request-commits-verified', 'false')
+    }
+
+    // Set outputs
+    for (const [key, value] of outputs) {
+      core.info(`${key} = ${value}`)
+      core.setOutput(key, value)
+    }
+    core.endGroup()
   } catch (error) {
     core.setFailed(utils.getErrorMessage(error))
   } finally {
-    // Remove auth and restore persisted auth config if it existed
     core.startGroup('Restore git configuration')
-    await gitAuthHelper.removeAuth()
-    await gitAuthHelper.restorePersistedAuth()
-    await gitAuthHelper.removeSafeDirectory()
+    if (inputs.pushToFork) {
+      await git.exec(['remote', 'rm', 'fork'])
+    }
+    await gitConfigHelper.close()
     core.endGroup()
   }
 }
